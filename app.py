@@ -15,6 +15,7 @@ import numpy as np
 from pydantic import BaseModel, Field
 import mimetypes
 from datetime import datetime
+import base64
 
 # Load environment variables
 load_dotenv()
@@ -188,6 +189,58 @@ class GeminiProcessor:
                 metadata={"original_text": response_text}
             )]
 
+    def _prepare_image_for_model(self, image_file) -> Optional[Dict[str, Any]]:
+        """Prepare image for model processing."""
+        try:
+            # Read image file
+            image_bytes = image_file.read()
+            image_file.seek(0)  # Reset file pointer
+            
+            # Convert to PIL Image
+            image = Image.open(io.BytesIO(image_bytes))
+            
+            # Convert to RGB if necessary
+            if image.mode != 'RGB':
+                image = image.convert('RGB')
+            
+            # Create byte stream
+            img_byte_arr = io.BytesIO()
+            image.save(img_byte_arr, format='PNG')
+            img_byte_arr = img_byte_arr.getvalue()
+            
+            return {
+                "mime_type": "image/png",
+                "data": base64.b64encode(img_byte_arr).decode('utf-8')
+            }
+            
+        except Exception as e:
+            logger.error(f"Error preparing image: {str(e)}")
+            return None
+
+    def _prepare_file_content(self, file) -> Optional[Dict[str, Any]]:
+        """Prepare file content for model processing."""
+        try:
+            mime_type, _ = mimetypes.guess_type(file.name)
+            
+            if mime_type and mime_type.startswith('image/'):
+                return self._prepare_image_for_model(file)
+            else:
+                # For text-based files
+                content = file.read()
+                file.seek(0)
+                
+                if isinstance(content, bytes):
+                    content = content.decode('utf-8')
+                
+                return {
+                    "mime_type": mime_type or "text/plain",
+                    "data": content
+                }
+                
+        except Exception as e:
+            logger.error(f"Error preparing file content: {str(e)}")
+            return None
+
     def process_files(self, files: List[Any], prompt: str) -> List[ResponseFormat]:
         """Process multiple files with the given prompt."""
         if not files:
@@ -225,8 +278,9 @@ class GeminiProcessor:
                 for attempt in range(self.max_retries):
                     try:
                         # Prepare file content
-                        content = file.read()
-                        file.seek(0)  # Reset file pointer for potential retry
+                        content = self._prepare_file_content(file)
+                        if not content:
+                            raise ValueError(f"Failed to prepare content for {file.name}")
                         
                         # Process with Gemini
                         response = self.model.generate_content([
@@ -245,17 +299,25 @@ class GeminiProcessor:
                             raise ValueError("No response from model")
 
                     except Exception as e:
-                        if "API key not valid" in str(e):
+                        error_msg = str(e)
+                        if "API key not valid" in error_msg:
                             results.append(ResponseFormat(
                                 content_type="error",
                                 data="Invalid API key. Please check your GOOGLE_API_KEY in the .env file.",
                                 metadata={"filename": file.name}
                             ))
                             break
+                        elif "quota exceeded" in error_msg.lower():
+                            results.append(ResponseFormat(
+                                content_type="error",
+                                data="API quota exceeded. Please try again later or check your quota limits.",
+                                metadata={"filename": file.name}
+                            ))
+                            break
                         elif attempt == self.max_retries - 1:
                             results.append(ResponseFormat(
                                 content_type="error",
-                                data=str(e),
+                                data=f"Error processing file after {self.max_retries} attempts: {str(e)}",
                                 metadata={"filename": file.name}
                             ))
                         time.sleep(1)  # Wait before retry
@@ -297,36 +359,68 @@ def display_response(response: ResponseFormat):
     try:
         st.markdown('<div class="results-container">', unsafe_allow_html=True)
         
+        # Display filename and timestamp
+        filename = response.metadata.get('filename', 'Unknown file')
+        processed_at = response.metadata.get('processed_at', '')
+        if processed_at:
+            st.write(f"### Results for {filename} (Processed at: {processed_at})")
+        else:
+            st.write(f"### Results for {filename}")
+        
         if response.content_type == "table":
-            st.write(f"### Results for {response.metadata.get('filename', 'Unknown file')}")
-            df = pd.DataFrame(response.data)
-            st.dataframe(df, use_container_width=True)
-            
-            # Add download button for CSV
-            csv = df.to_csv(index=False)
-            st.download_button(
-                "Download as CSV",
-                csv,
-                f"{response.metadata.get('filename', 'results')}.csv",
-                "text/csv",
-                key=f"download_{response.metadata.get('filename', 'results')}"
-            )
+            try:
+                df = pd.DataFrame(response.data)
+                st.dataframe(df, use_container_width=True)
+                
+                # Add download button for CSV
+                csv = df.to_csv(index=False)
+                st.download_button(
+                    "Download as CSV",
+                    csv,
+                    f"{filename}_results.csv",
+                    "text/csv",
+                    key=f"download_{filename}"
+                )
+            except Exception as table_error:
+                st.error(f"Error displaying table: {str(table_error)}")
+                st.json(response.data)  # Fallback to raw data display
 
         elif response.content_type == "code":
-            st.write(f"### Code from {response.metadata.get('filename', 'Unknown file')}")
-            st.code(response.data, language=response.metadata.get("language", ""))
+            try:
+                st.code(response.data, language=response.metadata.get("language", ""))
+            except Exception as code_error:
+                st.error(f"Error displaying code: {str(code_error)}")
+                st.text(response.data)  # Fallback to plain text
 
         elif response.content_type == "error":
-            st.error(f"Error processing {response.metadata.get('filename', 'Unknown file')}: {response.data}")
+            error_msg = response.data
+            if isinstance(error_msg, (dict, list)):
+                st.error("Error processing file")
+                st.json(error_msg)
+            else:
+                st.error(str(error_msg))
 
         else:  # Default text display
-            st.write(f"### Results for {response.metadata.get('filename', 'Unknown file')}")
-            st.markdown(response.data)
+            try:
+                st.markdown(response.data)
+            except Exception as text_error:
+                st.error(f"Error displaying text: {str(text_error)}")
+                st.text(response.data)  # Fallback to plain text
+        
+        # Display raw response data in expander for debugging
+        with st.expander("Show raw response data"):
+            st.json({
+                "content_type": response.content_type,
+                "metadata": response.metadata,
+                "data": response.data
+            })
         
         st.markdown('</div>', unsafe_allow_html=True)
 
     except Exception as e:
         st.error(f"Error displaying response: {str(e)}")
+        st.warning("Displaying raw response data:")
+        st.json(response.dict())
 
 def main():
     """Main application function."""
@@ -376,11 +470,15 @@ def main():
                 st.success(f"Results saved to {save_dir}")
 
                 # Display results
-                for result in results:
-                    display_response(result)
+                if not results:
+                    st.warning("No results were generated. Please try again.")
+                else:
+                    for result in results:
+                        display_response(result)
 
         except Exception as e:
             st.error(f"Error during processing: {str(e)}")
+            logger.exception("Error during file processing")
 
     # Display usage instructions in sidebar
     with st.sidebar:
