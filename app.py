@@ -16,6 +16,9 @@ from pydantic import BaseModel, Field
 import mimetypes
 from datetime import datetime
 import base64
+import chardet  # For encoding detection
+import PyPDF2  # For PDF processing
+import fitz  # PyMuPDF for better PDF handling
 
 # Load environment variables
 load_dotenv()
@@ -72,7 +75,7 @@ class ResponseFormat(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional metadata about the content")
 
 class GeminiProcessor:
-    """Handles file processing using Google's Gemini Vision API."""
+    """Handles file processing using Google's Gemini Vision API with enhanced error handling."""
     
     SUPPORTED_MIME_TYPES = {
         'text/plain': '.txt',
@@ -86,7 +89,7 @@ class GeminiProcessor:
     }
     
     def __init__(self, max_retries: int = 3):
-        """Initialize the Gemini processor."""
+        """Initialize the Gemini processor with enhanced error handling."""
         try:
             api_key = os.getenv("GOOGLE_API_KEY")
             if not api_key:
@@ -102,7 +105,7 @@ class GeminiProcessor:
             raise
 
     def _validate_file(self, file) -> Optional[str]:
-        """Validate the uploaded file."""
+        """Validate the uploaded file with enhanced checks."""
         try:
             if not file:
                 return "No file provided"
@@ -119,14 +122,93 @@ class GeminiProcessor:
             # Additional validation for images
             if mime_type.startswith('image/'):
                 try:
+                    file.seek(0)
                     Image.open(file)
-                except Exception:
-                    return f"Invalid image file: {file.name}"
+                    file.seek(0)  # Reset file pointer
+                except Exception as e:
+                    return f"Invalid image file: {file.name} - {str(e)}"
             
             return None
             
         except Exception as e:
             return f"Error validating file: {str(e)}"
+
+    def _detect_encoding(self, content_bytes: bytes) -> str:
+        """Detect the encoding of text content."""
+        try:
+            # Try to detect encoding using chardet
+            detected = chardet.detect(content_bytes)
+            if detected and detected['encoding']:
+                confidence = detected.get('confidence', 0)
+                if confidence > 0.7:  # High confidence threshold
+                    return detected['encoding']
+            
+            # Fallback encodings to try
+            fallback_encodings = ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1']
+            
+            for encoding in fallback_encodings:
+                try:
+                    content_bytes.decode(encoding)
+                    return encoding
+                except UnicodeDecodeError:
+                    continue
+            
+            # If all else fails, use utf-8 with error handling
+            return 'utf-8'
+            
+        except Exception as e:
+            logger.warning(f"Error detecting encoding: {str(e)}")
+            return 'utf-8'
+
+    def _extract_pdf_text(self, file) -> str:
+        """Extract text from PDF file using multiple methods."""
+        try:
+            file.seek(0)
+            content_bytes = file.read()
+            file.seek(0)
+            
+            # Method 1: Try PyMuPDF (fitz) - better for complex PDFs
+            try:
+                pdf_document = fitz.open(stream=content_bytes, filetype="pdf")
+                text_content = ""
+                
+                for page_num in range(pdf_document.page_count):
+                    page = pdf_document[page_num]
+                    text_content += page.get_text()
+                    text_content += "\n\n"  # Add page separator
+                
+                pdf_document.close()
+                
+                if text_content.strip():
+                    return text_content.strip()
+                    
+            except Exception as e:
+                logger.warning(f"PyMuPDF extraction failed: {str(e)}")
+            
+            # Method 2: Try PyPDF2 as fallback
+            try:
+                file.seek(0)
+                pdf_reader = PyPDF2.PdfReader(file)
+                text_content = ""
+                
+                for page in pdf_reader.pages:
+                    text_content += page.extract_text()
+                    text_content += "\n\n"  # Add page separator
+                
+                if text_content.strip():
+                    return text_content.strip()
+                    
+            except Exception as e:
+                logger.warning(f"PyPDF2 extraction failed: {str(e)}")
+            
+            # If both methods fail, return error message
+            return f"Unable to extract text from PDF: {file.name}. The PDF might be image-based or corrupted."
+            
+        except Exception as e:
+            logger.error(f"Error extracting PDF text: {str(e)}")
+            return f"Error processing PDF: {str(e)}"
+        finally:
+            file.seek(0)  # Reset file pointer
 
     def _parse_response(self, response_text: str) -> List[ResponseFormat]:
         """Parse and structure the model's response."""
@@ -218,27 +300,56 @@ class GeminiProcessor:
             return None
 
     def _prepare_file_content(self, file) -> Optional[Dict[str, Any]]:
-        """Prepare file content for model processing."""
+        """Prepare file content for model processing with enhanced handling for all file types."""
         try:
             mime_type, _ = mimetypes.guess_type(file.name)
+            file.seek(0)  # Ensure we're at the beginning of the file
             
+            # Handle images
             if mime_type and mime_type.startswith('image/'):
-                return self._prepare_image_for_model(file)
+                image_data = self._prepare_image_for_model(file)
+                if image_data:
+                    # Return only the fields Gemini API expects
+                    return {
+                        "mime_type": image_data["mime_type"],
+                        "data": image_data["data"]
+                    }
+                return None
+            
+            # Handle PDFs
+            elif mime_type == 'application/pdf':
+                text_content = self._extract_pdf_text(file)
+                # Return as plain text for Gemini API
+                return {
+                    "mime_type": "text/plain",
+                    "data": text_content
+                }
+            
+            # Handle text-based files
             else:
-                # For text-based files
-                content = file.read()
-                file.seek(0)
+                content_bytes = file.read()
+                file.seek(0)  # Reset file pointer
                 
-                if isinstance(content, bytes):
-                    content = content.decode('utf-8')
+                if isinstance(content_bytes, bytes):
+                    # Detect encoding and decode
+                    encoding = self._detect_encoding(content_bytes)
+                    try:
+                        content = content_bytes.decode(encoding)
+                    except UnicodeDecodeError as e:
+                        # If decoding fails, use utf-8 with error replacement
+                        logger.warning(f"Decoding failed with {encoding}, using utf-8 with error replacement")
+                        content = content_bytes.decode('utf-8', errors='replace')
+                else:
+                    content = str(content_bytes)
                 
+                # Return only the fields Gemini API expects
                 return {
                     "mime_type": mime_type or "text/plain",
                     "data": content
                 }
                 
         except Exception as e:
-            logger.error(f"Error preparing file content: {str(e)}")
+            logger.error(f"Error preparing file content for {file.name}: {str(e)}")
             return None
 
     def process_files(self, files: List[Any], prompt: str) -> List[ResponseFormat]:
@@ -278,21 +389,37 @@ class GeminiProcessor:
                 for attempt in range(self.max_retries):
                     try:
                         # Prepare file content
-                        content = self._prepare_file_content(file)
-                        if not content:
+                        content_data = self._prepare_file_content(file)
+                        if not content_data:
                             raise ValueError(f"Failed to prepare content for {file.name}")
                         
+                        # Create proper content structure for Gemini API
+                        if content_data.get("mime_type", "").startswith("image/"):
+                            # For images, create a proper blob
+                            content_parts = [
+                                prompt,
+                                {
+                                    "mime_type": content_data["mime_type"],
+                                    "data": content_data["data"]
+                                }
+                            ]
+                        else:
+                            # For text content, just include the text
+                            content_parts = [
+                                prompt,
+                                content_data["data"]
+                            ]
+                        
                         # Process with Gemini
-                        response = self.model.generate_content([
-                            prompt,
-                            content
-                        ])
+                        response = self.model.generate_content(content_parts)
 
                         if response and response.text:
                             parsed_responses = self._parse_response(response.text)
                             for resp in parsed_responses:
                                 resp.metadata["filename"] = file.name
                                 resp.metadata["processed_at"] = datetime.now().isoformat()
+                                # Add file processing metadata
+                                resp.metadata["file_type"] = content_data.get("mime_type", "unknown")
                             results.extend(parsed_responses)
                             break
                         else:
@@ -300,25 +427,34 @@ class GeminiProcessor:
 
                     except Exception as e:
                         error_msg = str(e)
+                        logger.error(f"Attempt {attempt + 1} failed for {file.name}: {error_msg}")
+                        
                         if "API key not valid" in error_msg:
                             results.append(ResponseFormat(
                                 content_type="error",
-                                data="Invalid API key. Please check your GOOGLE_API_KEY in the .env file.",
-                                metadata={"filename": file.name}
+                                data="Invalid API key. Please check your GOOGLE_API_KEY configuration.",
+                                metadata={"filename": file.name, "error_type": "auth"}
                             ))
                             break
                         elif "quota exceeded" in error_msg.lower():
                             results.append(ResponseFormat(
                                 content_type="error",
                                 data="API quota exceeded. Please try again later or check your quota limits.",
-                                metadata={"filename": file.name}
+                                metadata={"filename": file.name, "error_type": "quota"}
+                            ))
+                            break
+                        elif "unknown field" in error_msg.lower():
+                            results.append(ResponseFormat(
+                                content_type="error",
+                                data=f"Content format error: {error_msg}. This may be due to unsupported content structure.",
+                                metadata={"filename": file.name, "error_type": "format"}
                             ))
                             break
                         elif attempt == self.max_retries - 1:
                             results.append(ResponseFormat(
                                 content_type="error",
                                 data=f"Error processing file after {self.max_retries} attempts: {str(e)}",
-                                metadata={"filename": file.name}
+                                metadata={"filename": file.name, "error_type": "processing", "attempts": self.max_retries}
                             ))
                         time.sleep(1)  # Wait before retry
 
